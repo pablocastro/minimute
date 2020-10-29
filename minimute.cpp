@@ -154,6 +154,11 @@ void SetupNotifyIconData(NOTIFYICONDATA &iconData, HWND hWnd, bool muted)
     StringCchCopy(iconData.szTip, sizeof(iconData.szTip) / sizeof(TCHAR), muted ? "Muted" : "Unmuted");
 }
 
+void NotifyIconToast()
+{
+
+}
+
 bool SetNotifyIcon(HINSTANCE hInstance, HWND hWnd, bool muted)
 {
     NOTIFYICONDATA iconData;
@@ -180,7 +185,7 @@ int __stdcall main()
         (hWnd = CreateNotifyWindow(hInstance)) != NULL &&
         InitializeNotifyIcon(hInstance, hWnd))
     {
-        if (RegisterHotKey(NULL, 1, 0, VK_SCROLL))
+        if (RegisterHotKey(NULL, 1, 0, VK_PAUSE))
         {
             SetNotifyIcon(hInstance, hWnd, Muted());
 
