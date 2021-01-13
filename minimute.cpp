@@ -6,22 +6,74 @@
 #include <strsafe.h>
 #include "resource.h"
 
+// To keep binary and runtime size to a minimum, minimute doesn't depend on the C runtime. Most of the weirdness
+// of this code comes from not being able to use the CRT (no new/delete/malloc, no exceptions, etc.)
+
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
-DEFINE_GUID(IID_IAudioEndpointVolume, 0x5CDF2C82, 0x841E, 0x4546, 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A);
+struct MicEntry
+{
+    IAudioEndpointVolume* pVol;
+};
 
-const char* MiniMute = "MiniMute";
-HICON hIconMuted;
-HICON hIconUnmuted;
+const char* g_MiniMute = "MiniMute";
+HICON g_hIconMuted;
+HICON g_hIconUnmuted;
+MicEntry* g_mics = nullptr;
+int g_micCount = 0;
 
 void Error(const char *msg)
 {
-    MessageBox(NULL, msg, MiniMute, MB_ICONERROR | MB_OK);
+    MessageBox(NULL, msg, g_MiniMute, MB_ICONERROR | MB_OK);
 }
 
-template<typename F>
-bool EnumerateMics(F action)
+void ClearMics()
 {
+    if (g_mics != nullptr)
+    {
+        for (int i = 0; i < g_micCount; i++)
+        {
+            if (g_mics[i].pVol != nullptr)
+            {
+                g_mics[i].pVol->Release();
+                g_mics[i].pVol = nullptr;
+            }
+        }
+
+        HeapFree(GetProcessHeap(), 0, g_mics);
+        g_mics = nullptr;
+    }
+}
+
+bool ExtractAudioEndpoint(IMMDeviceCollection* pColl, UINT index, MicEntry *pEntry)
+{
+    IMMDevice* pDevice = nullptr;
+    pEntry->pVol = nullptr;
+    if (pColl->Item(index, &pDevice) == S_OK)
+    {
+        IAudioEndpointVolume* pVol = nullptr;
+        if (pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&pVol) == S_OK)
+        {
+            pEntry->pVol = pVol;
+        }
+        else
+        {
+            Error("Failed to retrieve volume interface");
+        }
+        pDevice->Release();
+    }
+    else
+    {
+        Error("Failed to retrieve audio device");
+    }
+
+    return pEntry->pVol != nullptr;
+}
+
+bool EnumerateMics()
+{
+    ClearMics();
+
     IMMDeviceEnumerator* pEnum = nullptr;
     bool result = false;
     if (CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnum) == S_OK)
@@ -38,31 +90,22 @@ bool EnumerateMics(F action)
                 }
                 else
                 {
-                    result = true;
-                    for (UINT i = 0; i < count; i++)
+                    g_mics = (MicEntry*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, count * sizeof(MicEntry));
+                    if (g_mics == nullptr) 
                     {
-                        IMMDevice* pDevice = nullptr;
-                        if (pColl->Item(i, &pDevice) == S_OK)
+                        Error("Not enough memory to enumerate devices");
+                    }
+                    else
+                    {
+                        g_micCount = count;
+                        result = true;
+                        for (UINT i = 0; i < count; i++)
                         {
-                            IAudioEndpointVolume* pVol = nullptr;
-                            if (pDevice->Activate(IID_IAudioEndpointVolume, CLSCTX_ALL, nullptr, (void**)&pVol) == S_OK)
+                            if (!ExtractAudioEndpoint(pColl, i, &g_mics[i]))
                             {
-                                action(i, pVol);
-                                pVol->Release();
-                            }
-                            else
-                            {
-                                Error("Failed to retrieve volume interface");
                                 result = false;
                                 break;
                             }
-                            pDevice->Release();
-                        }
-                        else
-                        {
-                            Error("Failed to retrieve audio device");
-                            result = false;
-                            break;
                         }
                     }
                 }
@@ -83,29 +126,34 @@ int FlipMute()
 {
     BOOL mute = true;
     int result = 0;
-    EnumerateMics([&mute, &result](int index, IAudioEndpointVolume* pVol)
+    if (EnumerateMics())
+    {
+        for (int i = 0; i < g_micCount; i++)
         {
-            if (index == 0)
+            if (g_mics[i].pVol != nullptr)
             {
-                if (pVol->GetMute(&mute) == S_OK)
+                if (i == 0)
                 {
-                    mute = !mute;
-                    result = mute ? 1 : 2;
+                    if (g_mics[i].pVol->GetMute(&mute) == S_OK)
+                    {
+                        mute = !mute;
+                        result = mute ? 1 : 2;
+                    }
+                    else
+                    {
+                        Error("Failed to get muted state");
+                        mute = true;
+                    }
                 }
-                else
-                {
-                    Error("Failed to get muted state");
-                    mute = true;
-                }
-            }
 
-            if (FAILED(pVol->SetMute(mute, nullptr)))
-            {
-                Error("Failed to mute/unmute at last one microphone");
-                result = 0;
+                if (FAILED(g_mics[i].pVol->SetMute(mute, nullptr)))
+                {
+                    Error("Failed to mute/unmute at last one microphone");
+                    result = 0;
+                }
             }
         }
-    );
+    }
 
     return result;
 }
@@ -113,14 +161,21 @@ int FlipMute()
 bool Muted()
 {
     bool anyUnmuted = false;
-    int result = EnumerateMics([&anyUnmuted](int, IAudioEndpointVolume* pVol)
+    if (EnumerateMics())
+    {
+        for (int i = 0; i < g_micCount; i++)
         {
-            BOOL muted;
-            if (pVol->GetMute(&muted) != S_OK || !muted) anyUnmuted = true;
+            if (g_mics[i].pVol != nullptr)
+            {
+                BOOL muted;
+                if (g_mics[i].pVol->GetMute(&muted) != S_OK || !muted) anyUnmuted = true;
+            }
         }
-    );
 
-    return result && !anyUnmuted;
+        return !anyUnmuted;
+    }
+
+    return false;
 }
 
 LRESULT CALLBACK NotifyWindowProcedure(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -134,13 +189,13 @@ HWND CreateNotifyWindow(HINSTANCE hInstance)
     SecureZeroMemory(&wndClass, sizeof(wndClass));
     wndClass.cbSize = sizeof(wndClass);
     wndClass.lpfnWndProc = NotifyWindowProcedure;
-    wndClass.lpszClassName = MiniMute;
+    wndClass.lpszClassName = g_MiniMute;
     wndClass.hInstance = hInstance;
     wndClass.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP));
     ATOM classAtom = RegisterClassEx(&wndClass);
     if (classAtom == 0) return NULL;
 
-    return CreateWindowEx(0, (LPCTSTR)classAtom, MiniMute, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+    return CreateWindowEx(0, (LPCTSTR)classAtom, g_MiniMute, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
 }
 
 void SetupNotifyIconData(NOTIFYICONDATA &iconData, HWND hWnd, bool muted)
@@ -150,13 +205,8 @@ void SetupNotifyIconData(NOTIFYICONDATA &iconData, HWND hWnd, bool muted)
     iconData.hWnd = hWnd;
     iconData.uID = 1;
     iconData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    iconData.hIcon = muted ? hIconMuted : hIconUnmuted;
+    iconData.hIcon = muted ? g_hIconMuted : g_hIconUnmuted;
     StringCchCopy(iconData.szTip, sizeof(iconData.szTip) / sizeof(TCHAR), muted ? "Muted" : "Unmuted");
-}
-
-void NotifyIconToast()
-{
-
 }
 
 bool SetNotifyIcon(HINSTANCE hInstance, HWND hWnd, bool muted)
@@ -168,8 +218,8 @@ bool SetNotifyIcon(HINSTANCE hInstance, HWND hWnd, bool muted)
 
 bool InitializeNotifyIcon(HINSTANCE hInstance, HWND hWnd)
 {
-    if (LoadIconMetric(hInstance, MAKEINTRESOURCEW(IDI_MUTED), LIM_SMALL, &hIconMuted) != S_OK ||
-        LoadIconMetric(hInstance, MAKEINTRESOURCEW(IDI_UNMUTED), LIM_SMALL, &hIconUnmuted) != S_OK) return false;
+    if (LoadIconMetric(hInstance, MAKEINTRESOURCEW(IDI_MUTED), LIM_SMALL, &g_hIconMuted) != S_OK ||
+        LoadIconMetric(hInstance, MAKEINTRESOURCEW(IDI_UNMUTED), LIM_SMALL, &g_hIconUnmuted) != S_OK) return false;
 
     NOTIFYICONDATA iconData;
     SetupNotifyIconData(iconData, hWnd, false);
