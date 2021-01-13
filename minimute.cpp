@@ -56,16 +56,10 @@ bool ExtractAudioEndpoint(IMMDeviceCollection* pColl, UINT index, MicEntry *pEnt
         {
             pEntry->pVol = pVol;
         }
-        else
-        {
-            Error("Failed to retrieve volume interface");
-        }
+        else Error("Failed to retrieve volume interface");
         pDevice->Release();
     }
-    else
-    {
-        Error("Failed to retrieve audio device");
-    }
+    else Error("Failed to retrieve audio device");
 
     return pEntry->pVol != nullptr;
 }
@@ -84,18 +78,10 @@ bool EnumerateMics()
             UINT count = 0;
             if (pColl->GetCount(&count) == S_OK)
             {
-                if (count == 0)
-                {
-                    Error("No audio devices");
-                }
-                else
+                if (count > 0)
                 {
                     g_mics = (MicEntry*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, count * sizeof(MicEntry));
-                    if (g_mics == nullptr) 
-                    {
-                        Error("Not enough memory to enumerate devices");
-                    }
-                    else
+                    if (g_mics != nullptr) 
                     {
                         g_micCount = count;
                         result = true;
@@ -108,7 +94,9 @@ bool EnumerateMics()
                             }
                         }
                     }
+                    else Error("Not enough memory to enumerate devices");
                 }
+                else Error("No audio devices");
             }
             else Error("Failed to get audio endpoint count");
             pColl->Release();
