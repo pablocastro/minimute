@@ -1,3 +1,4 @@
+#define __INLINE_ISEQUAL_GUID // avoid dependency on memcmp
 #include <initguid.h>
 #include <combaseapi.h>
 #include <mmdeviceapi.h>
@@ -11,20 +12,66 @@
 
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
-struct MicEntry
+bool Muted(bool rescan);
+bool SetNotifyIcon(bool muted);
+
+// Lots of simplifying assumptions for minimalism: not thread safe (running in STA), not honoring the Release() behavior
+class CEndpointCallback : public IAudioEndpointVolumeCallback
 {
-    IAudioEndpointVolume* pVol;
+    LONG _refCount;
+
+public:
+    CEndpointCallback() : _refCount(1) {}
+
+    STDMETHOD(QueryInterface)(REFIID riid, void** ppvObject)
+    {
+        if (IID_IUnknown == riid)
+        {
+            AddRef();
+            *ppvObject = (IUnknown*)this;
+        }
+        else if (__uuidof(IAudioEndpointVolumeCallback) == riid)
+        {
+            AddRef();
+            *ppvObject = (IAudioEndpointVolumeCallback*)this;
+        }
+        else
+        {
+            *ppvObject = nullptr;
+            return E_NOINTERFACE;
+        }
+        return S_OK;
+    }
+
+    STDMETHOD_(ULONG, AddRef)()
+    {
+        return ++_refCount;
+    }
+
+    STDMETHOD_(ULONG, Release)()
+    {
+        if (_refCount > 0) _refCount--;
+        return _refCount;
+    }
+
+    STDMETHOD(OnNotify)(PAUDIO_VOLUME_NOTIFICATION_DATA pNotify)
+    {
+        SetNotifyIcon(Muted(false));
+        return S_OK;
+    }
 };
 
 const char* g_MiniMute = "MiniMute";
 HICON g_hIconMuted;
 HICON g_hIconUnmuted;
-MicEntry* g_mics = nullptr;
+HWND g_hNotificationWindow;
+IAudioEndpointVolume** g_mics = nullptr;
 int g_micCount = 0;
+CEndpointCallback *g_endpointCallback;
 
-void Error(const char *msg)
+void Error(const char *msg, UINT type = MB_ICONERROR)
 {
-    MessageBox(NULL, msg, g_MiniMute, MB_ICONERROR | MB_OK);
+    MessageBox(NULL, msg, g_MiniMute, type | MB_OK);
 }
 
 void ClearMics()
@@ -33,10 +80,11 @@ void ClearMics()
     {
         for (int i = 0; i < g_micCount; i++)
         {
-            if (g_mics[i].pVol != nullptr)
+            if (g_mics[i] != nullptr)
             {
-                g_mics[i].pVol->Release();
-                g_mics[i].pVol = nullptr;
+                g_mics[i]->UnregisterControlChangeNotify(g_endpointCallback);
+                g_mics[i]->Release();
+                g_mics[i]= nullptr;
             }
         }
 
@@ -45,23 +93,26 @@ void ClearMics()
     }
 }
 
-bool ExtractAudioEndpoint(IMMDeviceCollection* pColl, UINT index, MicEntry *pEntry)
+bool ExtractAudioEndpoint(IMMDeviceCollection* pColl, UINT index, IAudioEndpointVolume **ppVol)
 {
     IMMDevice* pDevice = nullptr;
-    pEntry->pVol = nullptr;
+    *ppVol = nullptr;
     if (pColl->Item(index, &pDevice) == S_OK)
     {
-        IAudioEndpointVolume* pVol = nullptr;
-        if (pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&pVol) == S_OK)
+        if (pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)ppVol) == S_OK)
         {
-            pEntry->pVol = pVol;
+            if ((*ppVol)->RegisterControlChangeNotify(g_endpointCallback) != S_OK)
+            {
+                Error("Failed to register for change notifications. Mute/unmute may continue to work, but mute state in traybar may not be accurate.",
+                      MB_ICONWARNING);
+            }
         }
         else Error("Failed to retrieve volume interface");
         pDevice->Release();
     }
     else Error("Failed to retrieve audio device");
 
-    return pEntry->pVol != nullptr;
+    return *ppVol != nullptr;
 }
 
 bool EnumerateMics()
@@ -80,7 +131,7 @@ bool EnumerateMics()
             {
                 if (count > 0)
                 {
-                    g_mics = (MicEntry*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, count * sizeof(MicEntry));
+                    g_mics = (IAudioEndpointVolume**)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, count * sizeof(IAudioEndpointVolume*));
                     if (g_mics != nullptr) 
                     {
                         g_micCount = count;
@@ -118,11 +169,11 @@ int FlipMute()
     {
         for (int i = 0; i < g_micCount; i++)
         {
-            if (g_mics[i].pVol != nullptr)
+            if (g_mics[i] != nullptr)
             {
                 if (i == 0)
                 {
-                    if (g_mics[i].pVol->GetMute(&mute) == S_OK)
+                    if (g_mics[i]->GetMute(&mute) == S_OK)
                     {
                         mute = !mute;
                         result = mute ? 1 : 2;
@@ -134,7 +185,7 @@ int FlipMute()
                     }
                 }
 
-                if (FAILED(g_mics[i].pVol->SetMute(mute, nullptr)))
+                if (FAILED(g_mics[i]->SetMute(mute, nullptr)))
                 {
                     Error("Failed to mute/unmute at last one microphone");
                     result = 0;
@@ -146,17 +197,17 @@ int FlipMute()
     return result;
 }
 
-bool Muted()
+bool Muted(bool rescan)
 {
     bool anyUnmuted = false;
-    if (EnumerateMics())
+    if (!rescan || EnumerateMics())
     {
         for (int i = 0; i < g_micCount; i++)
         {
-            if (g_mics[i].pVol != nullptr)
+            if (g_mics[i] != nullptr)
             {
                 BOOL muted;
-                if (g_mics[i].pVol->GetMute(&muted) != S_OK || !muted) anyUnmuted = true;
+                if (g_mics[i]->GetMute(&muted) != S_OK || !muted) anyUnmuted = true;
             }
         }
 
@@ -197,10 +248,10 @@ void SetupNotifyIconData(NOTIFYICONDATA &iconData, HWND hWnd, bool muted)
     StringCchCopy(iconData.szTip, sizeof(iconData.szTip) / sizeof(TCHAR), muted ? "Muted" : "Unmuted");
 }
 
-bool SetNotifyIcon(HINSTANCE hInstance, HWND hWnd, bool muted)
+bool SetNotifyIcon(bool muted)
 {
     NOTIFYICONDATA iconData;
-    SetupNotifyIconData(iconData, hWnd, muted);
+    SetupNotifyIconData(iconData, g_hNotificationWindow, muted);
     return Shell_NotifyIcon(NIM_MODIFY, &iconData);
 }
 
@@ -217,15 +268,17 @@ bool InitializeNotifyIcon(HINSTANCE hInstance, HWND hWnd)
 int __stdcall main()
 {
     HINSTANCE hInstance = GetModuleHandle(nullptr);
-    HWND hWnd;
 
-    if (CoInitializeEx(NULL, COINIT_MULTITHREADED) == S_OK &&
-        (hWnd = CreateNotifyWindow(hInstance)) != NULL &&
-        InitializeNotifyIcon(hInstance, hWnd))
+    static CEndpointCallback endpointCallback;
+    g_endpointCallback = &endpointCallback;
+
+    if (CoInitializeEx(NULL, COINIT_APARTMENTTHREADED) == S_OK &&
+        (g_hNotificationWindow = CreateNotifyWindow(hInstance)) != NULL &&
+        InitializeNotifyIcon(hInstance, g_hNotificationWindow))
     {
         if (RegisterHotKey(NULL, 1, 0, VK_PAUSE))
         {
-            SetNotifyIcon(hInstance, hWnd, Muted());
+            SetNotifyIcon(Muted(false));
 
             MSG msg;
             while (GetMessage(&msg, NULL, 0, 0) != 0)
@@ -233,8 +286,10 @@ int __stdcall main()
                 if (msg.message == WM_HOTKEY)
                 {
                     int r = FlipMute();
-                    SetNotifyIcon(hInstance, hWnd, r == 1);
+                    SetNotifyIcon(r == 1);
                 }
+
+                DispatchMessage(&msg);
             }
         }
         else Error("Failed to register hot key. Another instance already running?");
