@@ -278,7 +278,7 @@ int __stdcall main()
     {
         if (RegisterHotKey(NULL, 1, 0, VK_PAUSE))
         {
-            SetNotifyIcon(Muted(false));
+            SetNotifyIcon(Muted(true));
 
             MSG msg;
             while (GetMessage(&msg, NULL, 0, 0) != 0)
