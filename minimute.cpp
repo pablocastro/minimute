@@ -12,11 +12,14 @@
 
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
+#define WM_ENUMERATE_MICS (WM_USER + 1)
+
 bool Muted(bool rescan);
 bool SetNotifyIcon(bool muted);
+bool EnumerateMics();
 
 // Lots of simplifying assumptions for minimalism: not thread safe (running in STA), not honoring the Release() behavior
-class CEndpointCallback : public IAudioEndpointVolumeCallback
+class CEndpointCallback : public IAudioEndpointVolumeCallback, public IMMNotificationClient
 {
     LONG _refCount;
 
@@ -28,12 +31,17 @@ public:
         if (IID_IUnknown == riid)
         {
             AddRef();
-            *ppvObject = (IUnknown*)this;
+            *ppvObject = (IUnknown*)(IAudioEndpointVolumeCallback*)this;
         }
         else if (__uuidof(IAudioEndpointVolumeCallback) == riid)
         {
             AddRef();
             *ppvObject = (IAudioEndpointVolumeCallback*)this;
+        }
+        else if (__uuidof(IMMNotificationClient) == riid)
+        {
+            AddRef();
+            *ppvObject = (IMMNotificationClient*)this;
         }
         else
         {
@@ -59,6 +67,34 @@ public:
         SetNotifyIcon(Muted(false));
         return S_OK;
     }
+
+    STDMETHOD(OnDeviceStateChanged)(LPCWSTR pwstrDeviceId, DWORD dwNewState)
+    {
+        PostMessage(NULL, WM_ENUMERATE_MICS, 0, 0);
+        return S_OK;
+    }
+
+    STDMETHOD(OnDeviceAdded)(LPCWSTR pwstrDeviceId)
+    {
+        PostMessage(NULL, WM_ENUMERATE_MICS, 0, 0);
+        return S_OK;
+    }
+
+    STDMETHOD(OnDeviceRemoved)(LPCWSTR pwstrDeviceId)
+    {
+        PostMessage(NULL, WM_ENUMERATE_MICS, 0, 0);
+        return S_OK;
+    }
+
+    STDMETHOD(OnDefaultDeviceChanged)(EDataFlow flow, ERole role, LPCWSTR pwstrDefaultDeviceId)
+    {
+        return S_OK;
+    }
+
+    STDMETHOD(OnPropertyValueChanged)(LPCWSTR pwstrDeviceId, const PROPERTYKEY key)
+    {
+        return S_OK;
+    }
 };
 
 const char* g_MiniMute = "MiniMute";
@@ -68,6 +104,7 @@ HWND g_hNotificationWindow;
 IAudioEndpointVolume** g_mics = nullptr;
 int g_micCount = 0;
 CEndpointCallback *g_endpointCallback;
+bool registeredForNotifications = false;
 
 void Error(const char *msg, UINT type = MB_ICONERROR)
 {
@@ -123,6 +160,12 @@ bool EnumerateMics()
     bool result = false;
     if (CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnum) == S_OK)
     {
+        if (!registeredForNotifications)
+        {
+            if (SUCCEEDED(pEnum->RegisterEndpointNotificationCallback(g_endpointCallback))) registeredForNotifications = true;
+            else Error("Warning: failed to register for device notifications, new devices may not be detected automatically.", MB_ICONWARNING);
+        }
+
         IMMDeviceCollection* pColl = nullptr;
         if (pEnum->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &pColl) == S_OK)
         {
@@ -287,6 +330,10 @@ int __stdcall main()
                 {
                     int r = FlipMute();
                     SetNotifyIcon(r == 1);
+                }
+                else if (msg.message == WM_ENUMERATE_MICS)
+                {
+                    EnumerateMics();
                 }
 
                 DispatchMessage(&msg);
